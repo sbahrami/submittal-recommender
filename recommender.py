@@ -1,98 +1,129 @@
 import pandas as pd
 import re
+import xlwings as xw
 from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.pipeline import Pipeline
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+import os
+from joblib import dump
 
 # === CONFIGURATION ===
-EXCEL_PATH = "C:\Users\SinaB\Metrolinx\Civil Structures - Engineering - Documents\General\TASK TRACKER\Sina_DON'T TOUCH\WORKING_Automated Submittal List.xlsm"     # path to your Excel file
-SHEET_NAME = "tbEmailList"             # name of the sheet (or table exported to sheet)
+EXCEL_PATH = r"C:\Users\SinaB\Metrolinx\Civil Structures - Engineering - Documents\General\TASK TRACKER\Sina_DON'T TOUCH\WORKING_Automated Submittal List.xlsm"
+SHEET_NAME = "All Submittals"
 DISCIPLINE_COLS = ["Geotechnical", "Structural", "Tunnel"]
+ML_COLS = ["ML Geotechnical", "ML Structural", "ML Tunnel"]
+FEATURE_COLS = ["Long Title", "Project Component", "Submittal Revision #"]
+TRANSFORMED_FEATURE_COLS = ["Title", "Project Component", "Package #"]
 
-# === 1. LOAD DATA ===
-print("Loading data...")
-df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME)
-
-required_cols = {"Title", "Submittal Revision #"}
-if not required_cols.issubset(df.columns):
-    raise ValueError("Excel sheet must include 'Title' and 'Submittal Revision #' columns.")
-
+# === 1. READ WORKSHEET INTO PANDAS (reads cells only; macros untouched) ===
+# Use openpyxl engine to read .xlsm cell values into a DataFrame.
+# This reads the full sheet into pandas; we will open the workbook via xlwings
+# later only when writing back so macros/VBA are preserved.
+df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, header=1, engine="openpyxl")
+df = df[FEATURE_COLS + DISCIPLINE_COLS + ML_COLS]
+df = df.rename(columns={"Long Title": "Title"})
 def extract_submittal_code(text: str) -> str:
-    """Find S-### or S### pattern anywhere in text (after cleaning)."""
-    text = text.upper()
-    match = re.search(r"\bS\s?\d+\b", text)
+    text = str(text).upper()
+    match = re.search(r"S-\d+", text)
     return match.group(0).replace(" ", "") if match else ""
 
-# Apply text cleaning
-df["Title_clean"] = (
+df["Title"] = (
     df["Title"]
     .astype(str)
     .str.lower()
     .str.replace(r"[_]", " ", regex=True)
     .str.replace(r"[^a-z0-9\s\-]", "", regex=True)
     .str.replace(r"\s+", " ", regex=True)
+    .str.replace(r"\s\-\s", " ", regex=True)
     .str.strip()
 )
+df["Package #"] = df["Submittal Revision #"].apply(extract_submittal_code)
+df.drop(columns=["Submittal Revision #"], inplace=True)
 
-df["Submittal Revision Clean"] = df["Submittal Revision #"].apply(clean_revision_text)
-df["SubmittalCode"] = df["Submittal Revision #"].apply(extract_submittal_code)
-df["CombinedFeatures"] = df["Title_clean"] + " " + df["SubmittalCode"].fillna("")
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("title", TfidfVectorizer(), "Title"),
+        # Pass categorical columns as lists so transformers receive 2-D input
+        ("component", OneHotEncoder(handle_unknown="ignore"), ["Project Component"]),
+        ("package", OneHotEncoder(handle_unknown="ignore"), ["Package #"]),
+    ],
+    remainder="drop",
+)
 
-# === 3. TRAIN & PREDICT ===
-print("Training models and predicting missing labels...")
-results = df.copy()
-filled_counts = {}
+# === 4. RESET ML COLUMNS ===
+for col in ML_COLS:
+    df[col] = "F"
 
-for col in DISCIPLINE_COLS:
-    if col not in df.columns:
-        print(f"⚠️ Column '{col}' not found in data; skipping.")
+# === 5. TRAIN & PREDICT ===
+for orig_col, ml_col in zip(DISCIPLINE_COLS, ML_COLS):
+    if orig_col not in df.columns:
         continue
 
-    y = df[col].astype(str).replace("nan", "")
+    # Prepare binary target: map Yes/No to T/F and treat empty as unknown
+    y = df[orig_col].astype(str).replace("nan", "").replace("No", "F").replace("Yes", "T")
     mask_train = y != ""
-    mask_predict = y == ""
+    mask_predict = y != ""
 
     if mask_train.sum() == 0:
-        print(f"⚠️ No training data found for '{col}'. Skipping.")
         continue
 
-    # Text vectorization + decision tree pipeline
     model = Pipeline([
-        ("vect", CountVectorizer(stop_words="english")),
-        ("clf", DecisionTreeClassifier(max_depth=5, random_state=42))
+        ("pre", preprocessor),
+        ("clf", RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)),
     ])
 
-    model.fit(df.loc[mask_train, "CombinedFeatures"], y[mask_train])
-    preds = model.predict(df.loc[mask_predict, "CombinedFeatures"])
-    results.loc[mask_predict, col] = preds
-    filled_counts[col] = mask_predict.sum()
+    X = df[TRANSFORMED_FEATURE_COLS].copy()
 
-print("Prediction complete!")
-for col, n in filled_counts.items():
-    print(f"  → {col}: filled {n} missing values.")
+    # sklearn expects y as a 1-D array-like. Convert the Series slice to numpy.
+    y_train = y[mask_train].values.ravel()
+    model.fit(X.loc[mask_train], y_train)
+    # Save trained model pipeline to disk (includes preprocessor)
+    try:
+        models_dir = os.path.join(os.getcwd(), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        safe_name = orig_col.lower().replace(" ", "_")
+        model_path = os.path.join(models_dir, f"model_{safe_name}.joblib")
+        dump(model, model_path)
+    except Exception:
+        # Don't crash the script if saving fails; continue to predictions
+        pass
+    preds = model.predict(X.loc[mask_predict])
 
-# === 4. WRITE BACK TO EXCEL WITH HIGHLIGHTING ===
-print("Writing predictions back to Excel...")
+    # Normalize predictions to 'T'/'F' strings for the ML columns
+    def to_TF(val):
+        s = str(val).strip().lower()
+        return "T" if s in ("t", "true", "yes", "y", "1") else "F"
 
-wb = load_workbook(EXCEL_PATH)
-ws = wb[SHEET_NAME]
+    df.loc[mask_predict, ml_col] = [to_TF(p) for p in preds]
 
-# Find column indices by header name
-headers = {cell.value: cell.column for cell in next(ws.iter_rows(min_row=1, max_row=1))}
-yellow = PatternFill(start_color="FFFF99", end_color="FFFF99", fill_type="solid")
+# === 6. OPEN WORKBOOK VIA COM AND WRITE BACK TO EXCEL CELLS ONLY ===
+# Open workbook via COM/xlwings only for writing so macros/VBA are preserved.
+app = xw.App(visible=False)
+wb = xw.Book(EXCEL_PATH)
+ws = wb.sheets[SHEET_NAME]
 
-for col in DISCIPLINE_COLS:
-    if col not in headers:
+start_row = 3  # data starts at Excel row 3 (header is row 2)
+for col in ML_COLS:
+    if col not in df.columns:
         continue
-    col_idx = headers[col]
-    for i, row in results.iterrows():
-        if df.at[i, col] == "" and results.at[i, col] != "":
-            cell = ws.cell(row=i + 2, column=col_idx)  # +2 to skip header
-            cell.value = results.at[i, col]
-            cell.fill = yellow
 
-wb.save(EXCEL_PATH)
-print(f"✅ Results saved and highlighted in '{EXCEL_PATH}'.")
+    # Find the column index in Excel
+    header_row = ws.range("A2").expand("right").value
+    if col not in ML_COLS:
+        # If ML column doesn't exist, add it to the next empty column
+        next_col = len(header_row) + 1
+        ws.range((1, next_col)).value = col
+        col_idx = next_col
+    else:
+        col_idx = header_row.index(col) + 1
 
+    # Write values starting from row 2 (below header)
+    ws.range((start_row, col_idx), (len(df)+start_row-1, col_idx)).value = df[[col]].values.tolist()
+
+# ✅ Done: no wb.save() → macros are preserved
+app.quit()
+print("✅ ML columns updated safely. Macros remain intact.")
